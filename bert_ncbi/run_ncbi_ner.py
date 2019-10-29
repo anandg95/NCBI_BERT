@@ -425,7 +425,7 @@ def filed_based_convert_examples_to_features(
         writer.write(tf_example.SerializeToString())
 
 
-def file_based_input_fn_builder(input_file, seq_length, is_training, drop_remainder):
+def file_based_input_fn_builder(input_file, seq_length, is_training, drop_remainder, batch_size):
     name_to_features = {
         "input_ids": tf.FixedLenFeature([seq_length], tf.int64),
         "input_mask": tf.FixedLenFeature([seq_length], tf.int64),
@@ -445,7 +445,8 @@ def file_based_input_fn_builder(input_file, seq_length, is_training, drop_remain
         return example
 
     def input_fn(params):
-        batch_size = params["batch_size"]
+        if FLAGS.use_tpu:
+            batch_size = params["batch_size"]
         d = tf.data.TFRecordDataset(input_file)
         if is_training:
             d = d.repeat()
@@ -547,11 +548,14 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
         if mode == tf.estimator.ModeKeys.TRAIN:
             train_op = optimization.create_optimizer(
                 total_loss, learning_rate, num_train_steps, num_warmup_steps, use_tpu)
-            output_spec = tf.contrib.tpu.TPUEstimatorSpec(
-                mode=mode,
-                loss=total_loss,
-                train_op=train_op,
-                scaffold_fn=scaffold_fn)
+            if FLAGS.use_tpu:
+                output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+                    mode=mode,
+                    loss=total_loss,
+                    train_op=train_op,
+                    scaffold_fn=scaffold_fn)
+            else:
+                output_spec = tf.estimator.EstimatorSpec(mode=mode, loss=total_loss, train_op=train_op, scaffold=scaffold_fn)
         elif mode == tf.estimator.ModeKeys.EVAL:
 
             def metric_fn(per_example_loss, label_ids, logits):
@@ -570,11 +574,14 @@ def model_fn_builder(bert_config, num_labels, init_checkpoint, learning_rate,
 
             eval_metrics = (metric_fn, [per_example_loss, label_ids, logits])
             # eval_metrics = (metric_fn, [label_ids, logits])
-            output_spec = tf.contrib.tpu.TPUEstimatorSpec(
-                mode=mode,
-                loss=total_loss,
-                eval_metrics=eval_metrics,
-                scaffold_fn=scaffold_fn)
+            if FLAGS.use_tpu:
+                output_spec = tf.contrib.tpu.TPUEstimatorSpec(
+                    mode=mode,
+                    loss=total_loss,
+                    eval_metrics=eval_metrics,
+                    scaffold_fn=scaffold_fn)
+            else:
+                output_spec = tf.estimator.EstimatorSpec(mode=mode, loss=total_loss, eval_metric_ops=eval_metrics, scaffold=scaffold_fn)
         else:
             output_spec = tf.contrib.tpu.TPUEstimatorSpec(
                 mode=mode, predictions=predicts, scaffold_fn=scaffold_fn
@@ -684,15 +691,26 @@ def main(_):
 
     is_per_host = tf.contrib.tpu.InputPipelineConfig.PER_HOST_V2
 
-    run_config = tf.contrib.tpu.RunConfig(
-        cluster=tpu_cluster_resolver,
-        master=FLAGS.master,
-        model_dir=FLAGS.output_dir,
-        save_checkpoints_steps=FLAGS.save_checkpoints_steps,
-        tpu_config=tf.contrib.tpu.TPUConfig(
-            iterations_per_loop=FLAGS.iterations_per_loop,
-            num_shards=FLAGS.num_tpu_cores,
-            per_host_input_for_training=is_per_host))
+    if not FLAGS.use_tpu:
+        sess_config = tf.ConfigProto()
+        sess_config.gpu_options.per_process_gpu_memory_fraction = 0.9
+        run_config = tf.estimator.RunConfig(
+            model_dir=FLAGS.output_dir,
+            save_checkpoints_steps=FLAGS.save_checkpoints_steps,
+            keep_checkpoint_max=1,
+            log_step_count_steps=10,
+            session_config=sess_config,
+        ) 
+    else:
+        run_config = tf.contrib.tpu.RunConfig(
+            cluster=tpu_cluster_resolver,
+            master=FLAGS.master,
+            model_dir=FLAGS.output_dir,
+            save_checkpoints_steps=FLAGS.save_checkpoints_steps,
+            tpu_config=tf.contrib.tpu.TPUConfig(
+                iterations_per_loop=FLAGS.iterations_per_loop,
+                num_shards=FLAGS.num_tpu_cores,
+                per_host_input_for_training=is_per_host))
 
     train_examples = None
     num_train_steps = None
@@ -714,13 +732,16 @@ def main(_):
         use_tpu=FLAGS.use_tpu,
         use_one_hot_embeddings=FLAGS.use_tpu)
 
-    estimator = tf.contrib.tpu.TPUEstimator(
-        use_tpu=FLAGS.use_tpu,
-        model_fn=model_fn,
-        config=run_config,
-        train_batch_size=FLAGS.train_batch_size,
-        eval_batch_size=FLAGS.eval_batch_size,
-        predict_batch_size=FLAGS.predict_batch_size)
+    if FLAGS.use_tpu:
+        estimator = tf.contrib.tpu.TPUEstimator(
+            use_tpu=FLAGS.use_tpu,
+            model_fn=model_fn,
+            config=run_config,
+            train_batch_size=FLAGS.train_batch_size,
+            eval_batch_size=FLAGS.eval_batch_size,
+            predict_batch_size=FLAGS.predict_batch_size)
+    else:
+        estimator = tf.estimator.Estimator(model_fn=model_fn, config=run_config)
 
     if FLAGS.do_train:
         train_file = os.path.join(FLAGS.output_dir, "train.tf_record")
@@ -734,7 +755,8 @@ def main(_):
             input_file=train_file,
             seq_length=FLAGS.max_seq_length,
             is_training=True,
-            drop_remainder=True)
+            drop_remainder=True,
+            batch_size=FLAGS.train_batch_size)
         estimator.train(input_fn=train_input_fn, max_steps=num_train_steps)
     if FLAGS.do_eval:
         eval_examples = processor.get_dev_examples(FLAGS.data_dir)
@@ -753,7 +775,8 @@ def main(_):
             input_file=eval_file,
             seq_length=FLAGS.max_seq_length,
             is_training=False,
-            drop_remainder=eval_drop_remainder)
+            drop_remainder=eval_drop_remainder,
+            batch_size=FLAGS.eval_batch_size)
         result = estimator.evaluate(input_fn=eval_input_fn, steps=eval_steps)
         output_eval_file = os.path.join(FLAGS.output_dir, "eval_results.txt")
         with tf.gfile.Open(output_eval_file, "w") as writer:
@@ -787,7 +810,8 @@ def main(_):
             input_file=predict_file,
             seq_length=FLAGS.max_seq_length,
             is_training=False,
-            drop_remainder=predict_drop_remainder)
+            drop_remainder=predict_drop_remainder,
+            batch_size=FLAGS.predict_batch_size)
 
         prf = estimator.evaluate(input_fn=predict_input_fn, steps=None)
         output_test_file = os.path.join(FLAGS.output_dir, "test_results.txt")
