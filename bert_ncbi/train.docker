@@ -1,0 +1,5 @@
+from tensorflow/tensorflow:1.14.0-gpu-py3
+run yes|apt-get install libsm6 libxrender1 libfontconfig1 libxext6 vim 
+
+# docker build -f train.docker -t pubmed_bert .
+# docker run -u $(id -u):$(id -g) --runtime=nvidia  -it --rm -v $PWD:/pubmed -w /pubmed pubmed_bert bash
