@@ -457,6 +457,7 @@ def file_based_input_fn_builder(
         return example
 
     def input_fn(params):
+        nonlocal batch_size
         if FLAGS.use_tpu:
             batch_size = params["batch_size"]
         d = tf.data.TFRecordDataset(input_file)
