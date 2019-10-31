@@ -14,6 +14,7 @@ import os
 import pickle
 import re
 import numpy as np
+import string
 
 import tensorflow as tf
 
@@ -451,19 +452,21 @@ def filed_based_convert_examples_to_features(
 
 
 
-def request_based_input_fn_builder(large_text, label_list, max_seq_length, tokenizer, output_file, batch_size=32):    
+def request_based_input_fn_builder(large_text, label_list, max_seq_length, tokenizer, batch_size=32):    
     def gen():
         "split large_text into smaller chunks"
         all_examples = []
         for (ex_index, example) in enumerate(large_text):
             feature = convert_single_example(ex_index, example, label_list, max_seq_length, tokenizer, mode="test")
-            all_examples.append(feature)
-        for ex in all_examples:
-            yield ex
+            yield feature
     
     def input_fn():
         nonlocal batch_size
-        d = tf.data.Dataset.from_generator(gen, output_shapes={}, output_types={})
+        d = tf.data.Dataset.from_generator(
+            gen,
+            output_shapes={"input_ids": (None,), "input_mask": (None,), "segment_ids": (None,), "label_ids": (None,)},
+            output_types={"input_ids": tf.int32, "input_mask": tf.int32, "segment_ids": tf.int32, "label_ids": tf.int32}
+            )
         d = d.batch(batch_size)
         return d
     return input_fn
@@ -699,6 +702,7 @@ def result_to_pair(
         tf.logging.error("{} vs {}".format(len(predict_examples), len(predictions)))
     print(output_predict_file)
     print(output_err_file)
+    to_print = []
     with tf.gfile.Open(output_predict_file, "w") as writer, tf.gfile.Open(
         output_err_file, "w"
     ) as err_writer:
@@ -752,10 +756,16 @@ def result_to_pair(
                     " ".join([id2label.get(i, "**NULL**") for i in pred_ids]) + "\n\n"
                 )
                 pred_labels += ["O"] * (len(words) - len(pred_labels))
-
+            
             for tok, label, pred_label in zip(words, labels, pred_labels):
                 writer.write(tok + " " + label + " " + pred_label + "\n")
+                if pred_label == "B":
+                    to_print.append(f"<{tok}>")
+                else:
+                    to_print.append(tok)
             writer.write("\n")
+        print("************* NER result ************")
+        print(" ".join(to_print))
 
 
 def main(_):
@@ -926,7 +936,12 @@ def main(_):
             raise ValueError("Prediction in TPU not supported")
         # predict_drop_remainder = True if FLAGS.use_tpu else False
         global whole_doc
-        predict_input_fn = request_based_input_fn_builder(large_text=whole_doc)
+        predict_input_fn = request_based_input_fn_builder(
+                large_text=whole_doc,
+                label_list=label_list,
+                max_seq_length=FLAGS.max_seq_length,
+                tokenizer=tokenizer
+                )
 
         # prf = estimator.evaluate(input_fn=predict_input_fn, steps=None)
         # output_test_file = os.path.join(FLAGS.output_dir, "test_results.txt")
@@ -950,9 +965,9 @@ def main(_):
         output_predict_file = os.path.join(FLAGS.output_dir, "test_labels.txt")
         output_err_file = os.path.join(FLAGS.output_dir, "test_labels_errs.txt")
         result_to_pair(
-            predict_examples, result, id2label, output_predict_file, output_err_file
+            whole_doc, result, id2label, output_predict_file, output_err_file
         )
-
+        """
         tf.logging.info("Reading: %s", output_predict_file)
         with tf.gfile.Open(output_predict_file, "r") as f:
             counts = evaluate(f)
@@ -962,21 +977,34 @@ def main(_):
             os.path.join(FLAGS.output_dir, "test_results_conlleval.txt"), "w"
         ) as fd:
             fd.write("".join(eval_result))
-
+        """
 
 
 def preprocess(whole_doc):
+    def _create_example(lines, set_type="custom_pred"):
+        examples = []
+        for (i, line) in enumerate(lines):
+            guid = "%s-%s" % (set_type, i)
+            text = tokenization.convert_to_unicode(line[1])
+            label = tokenization.convert_to_unicode(line[0])
+            examples.append(InputExample(guid=guid, text=text, label=label))
+        return examples
     whole_doc = whole_doc.replace('\n', ' ')
-    tokens = re.split("([^a-zA-Z])", whole_doc)
-    tokens = [i for i in tokens if len(i)>0 and i != ' ']
+    all_special_chars = string.punctuation
+    for sc in all_special_chars:
+        whole_doc = whole_doc.replace(sc, f" {sc} ")
+    # tokens = re.split("([^a-zA-Z])", whole_doc)
+    # tokens = [i for i in tokens if len(i)>0 and i != ' ']
+    tokens = whole_doc.split()
+    print(tokens)
     lines = []
     while len(tokens) > 0:
         tok_list = tokens[:30]
         labels = " ".join(["X"]*len(tok_list))
-        lines.append([" ".join(tok_list), labels])
+        lines.append([labels, " ".join(tok_list)])
         tokens = tokens[30:]
-    return lines
-
+    all_examples = _create_example(lines)
+    return all_examples
 
 if __name__ == "__main__":
     flags.mark_flag_as_required("data_dir")
